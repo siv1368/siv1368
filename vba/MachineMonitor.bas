@@ -1,22 +1,16 @@
 Attribute VB_Name = "MachineMonitor"
 '==========================================================================
-'  MachineMonitor.bas  —  VBA backend for MachineMonitor.xlsm
+'  MachineMonitor.bas
 '
-'  One-time install:
-'     1. Open MachineMonitor.xlsx in Excel
-'     2. Alt+F11 → File → Import File… → pick this .bas file
-'     3. Close VBE, Save As Macro-Enabled Workbook (*.xlsm)
-'     4. Alt+F8 → run "SetupWorkbook" once
+'  CSV schema (8 columns):
+'     machine_id, tag, timestamp, metric1, metric2, metric3,
+'     running_hours (cumulative meter), downtime_hours (per-row delta)
 '
-'  Public macros:
-'     SetupWorkbook        — installs shape buttons, hotkeys
-'     ImportCSV            — batch-load a CSV into the Data sheet
-'     RefreshDashboard     — recompute picker + comparison charts
-'     GenerateReport       — new sheet snapshot + PDF export
-'     ClearData            — wipe the Data table (with confirm)
-'     AddMachine           — append a machine from the Dashboard ADD panel
-'     RefreshMachinePicker — populate the Dashboard's machine picker
-'     ToggleLive           — enable/disable 60-second auto-refresh
+'  Utilization formulas (per machine, per date range):
+'     run_hrs   = last_meter - first_meter        (delta of cumulative)
+'     down_hrs  = SUM(downtime_hours)              in the range
+'     util_avail % = run / (run + down) * 100
+'     util_cal   % = run / (24 * (endDate-startDate+1)) * 100
 '==========================================================================
 Option Explicit
 
@@ -27,10 +21,8 @@ Private Const SHT_REPORTS As String = "Reports"
 Private Const TBL_DATA As String    = "tblData"
 Private Const TBL_MACH As String    = "tblMachines"
 
-' Picker is 2 groups of columns × 8 rows = 16 slots
-'   Group 1: Show=B, ID=C, Name=D   rows 20..27
-'   Group 2: Show=F, ID=G, Name=H   rows 20..27
-Private Const PICK_R0 As Long = 20
+' Picker + utilization table: 8 rows starting at row 22
+Private Const PICK_R0 As Long = 22
 Private Const PICK_ROWS As Long = 8
 
 Private Const LIVE_INTERVAL_SEC As Long = 60
@@ -41,8 +33,7 @@ Public gNextTick As Double
 '  ONE-TIME SETUP
 '--------------------------------------------------------------------------
 Public Sub SetupWorkbook()
-    Dim ws As Worksheet
-    Set ws = ThisWorkbook.Worksheets(SHT_DASH)
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(SHT_DASH)
 
     Dim shp As Shape, i As Long
     For i = ws.Shapes.count To 1 Step -1
@@ -50,11 +41,11 @@ Public Sub SetupWorkbook()
         If Left$(shp.Name, 3) = "btn" Then shp.Delete
     Next i
 
-    AddButton ws, "btnImport",  ws.Range("J7:L7"),  "IMPORT  CSV",        "ImportCSV"
-    AddButton ws, "btnRefresh", ws.Range("J8:L8"),  "REFRESH  DASHBOARD", "RefreshDashboard"
-    AddButton ws, "btnReport",  ws.Range("N7:P7"),  "GENERATE  REPORT",   "GenerateReport"
-    AddButton ws, "btnClear",   ws.Range("N8:P8"),  "CLEAR  DATA",        "ClearData"
-    AddButton ws, "btnAdd",     ws.Range("N16:P16"), "ADD  MACHINE",      "AddMachine"
+    AddButton ws, "btnImport",  ws.Range("J7:L7"),   "IMPORT  CSV",        "ImportCSV"
+    AddButton ws, "btnRefresh", ws.Range("J8:L8"),   "REFRESH  DASHBOARD", "RefreshDashboard"
+    AddButton ws, "btnReport",  ws.Range("N7:P7"),   "GENERATE  REPORT",   "GenerateReport"
+    AddButton ws, "btnClear",   ws.Range("N8:P8"),   "CLEAR  DATA",        "ClearData"
+    AddButton ws, "btnAdd",     ws.Range("N18:P18"), "ADD  MACHINE",       "AddMachine"
 
     Application.OnKey "^+i", "ImportCSV"
     Application.OnKey "^+r", "RefreshDashboard"
@@ -93,7 +84,7 @@ Private Sub AddButton(ws As Worksheet, nm As String, rng As Range, _
 End Sub
 
 '--------------------------------------------------------------------------
-'  ADD  MACHINE  (from the Dashboard ADD panel)
+'  ADD  MACHINE
 '--------------------------------------------------------------------------
 Public Sub AddMachine()
     Dim wsD As Worksheet: Set wsD = ThisWorkbook.Worksheets(SHT_DASH)
@@ -107,29 +98,24 @@ Public Sub AddMachine()
     Dim m3 As String:  m3  = Trim$(CStr(wsD.Range("AddM3").Value))
 
     If Len(mid) = 0 Or Len(nm) = 0 Or Len(tg) = 0 Then
-        MsgBox "Fill in at least Machine ID, Name, and Tag.", _
-               vbExclamation, "Add machine"
+        MsgBox "Fill in at least Machine ID, Name, and Tag.", vbExclamation, "Add machine"
         Exit Sub
     End If
 
     Dim lo As ListObject: Set lo = wsC.ListObjects(TBL_MACH)
 
-    ' Duplicate-ID guard
     If Not lo.DataBodyRange Is Nothing Then
         Dim arr As Variant: arr = lo.DataBodyRange.Value
         Dim i As Long
         For i = 1 To UBound(arr, 1)
             If UCase$(Trim$(CStr(arr(i, 1)))) = UCase$(mid) Then
-                MsgBox "Machine ID '" & mid & "' already exists.", _
-                       vbExclamation, "Add machine"
+                MsgBox "Machine ID '" & mid & "' already exists.", vbExclamation, "Add machine"
                 Exit Sub
             End If
         Next i
     End If
 
-    ' Find first empty row inside the table
-    Dim r As Long, targetRow As Range
-    Set targetRow = Nothing
+    Dim targetRow As Range: Set targetRow = Nothing
     If lo.DataBodyRange Is Nothing Then
         Set targetRow = lo.ListRows.Add.Range
     Else
@@ -141,8 +127,7 @@ Public Sub AddMachine()
         Next i
         If targetRow Is Nothing Then
             If lo.DataBodyRange.Rows.count >= 16 Then
-                MsgBox "The 16-machine limit has been reached.", _
-                       vbExclamation, "Add machine"
+                MsgBox "The 16-machine limit has been reached.", vbExclamation, "Add machine"
                 Exit Sub
             End If
             Set targetRow = lo.ListRows.Add.Range
@@ -159,10 +144,8 @@ Public Sub AddMachine()
         .Cells(1, 7).Value = "Yes"
     End With
 
-    ' Clear the input row
     wsD.Range("AddMID,AddName,AddTag,AddM1,AddM2,AddM3").ClearContents
 
-    ' If the new machine belongs to the currently selected tag, add it to picker
     If tg = CStr(wsD.Range("TagFilter").Value) Then RefreshMachinePicker True
 
     MsgBox "Added " & mid & " (" & nm & ") under tag '" & tg & "'.", _
@@ -171,39 +154,32 @@ End Sub
 
 '--------------------------------------------------------------------------
 '  REFRESH  MACHINE  PICKER
-'   forceReset = True  → wipe & repopulate with all Yes
-'   forceReset = False → preserve existing Yes/No selections if tag unchanged
 '--------------------------------------------------------------------------
 Public Sub RefreshMachinePicker(Optional forceReset As Boolean = False)
     Dim wsD As Worksheet: Set wsD = ThisWorkbook.Worksheets(SHT_DASH)
     Dim wsC As Worksheet: Set wsC = ThisWorkbook.Worksheets(SHT_CONF)
 
-    Dim tag As String
-    tag = Trim$(CStr(wsD.Range("TagFilter").Value))
+    Dim tag As String: tag = Trim$(CStr(wsD.Range("TagFilter").Value))
+    Dim lastTag As String: lastTag = CStr(wsD.Range("LastTag").Value)
 
-    Dim lastTag As String
-    lastTag = CStr(wsD.Range("LastTag").Value)
-
-    ' Snapshot current picker (mid → show) so we can preserve on same-tag refresh
-    Dim prevSel As Object
-    Set prevSel = CreateObject("Scripting.Dictionary")
+    Dim prevSel As Object: Set prevSel = CreateObject("Scripting.Dictionary")
     If Not forceReset And lastTag = tag Then
         Dim rr As Long, k As Long
         For rr = 0 To PICK_ROWS - 1
             k = PICK_R0 + rr
-            SnapshotOne wsD, prevSel, "C" & k, "B" & k   ' group 1
-            SnapshotOne wsD, prevSel, "G" & k, "F" & k   ' group 2
+            Dim m As String, s As String
+            m = Trim$(CStr(wsD.Range("C" & k).Value))
+            s = Trim$(CStr(wsD.Range("B" & k).Value))
+            If Len(m) > 0 And Not prevSel.Exists(m) Then prevSel.Add m, s
         Next rr
     End If
 
-    ' Wipe picker area
+    ' Clear picker + per-machine util columns  (cols B..P for the 8 rows)
     Dim rClear As Long
     For rClear = PICK_R0 To PICK_R0 + PICK_ROWS - 1
-        wsD.Range("B" & rClear & ":D" & rClear).ClearContents
-        wsD.Range("F" & rClear & ":H" & rClear).ClearContents
+        wsD.Range("B" & rClear & ":P" & rClear).ClearContents
     Next rClear
 
-    ' Gather machines from Config matching tag & Active=Yes
     Dim lo As ListObject: Set lo = wsC.ListObjects(TBL_MACH)
     If lo.DataBodyRange Is Nothing Then GoTo Finalize
     Dim arr As Variant: arr = lo.DataBodyRange.Value
@@ -215,21 +191,11 @@ Public Sub RefreshMachinePicker(Optional forceReset As Boolean = False)
         nm  = Trim$(CStr(arr(i, 2)))
         tg  = Trim$(CStr(arr(i, 3)))
         act = UCase$(Trim$(CStr(arr(i, 7))))
-        If Len(mid) > 0 And tg = tag And act = "YES" Then
-            Dim rowIdx As Long, groupCol As String
-            If slot < PICK_ROWS Then
-                rowIdx = PICK_R0 + slot
-                wsD.Range("B" & rowIdx).Value = _
-                    IIf(prevSel.Exists(mid), prevSel(mid), "Yes")
-                wsD.Range("C" & rowIdx).Value = mid
-                wsD.Range("D" & rowIdx).Value = nm
-            ElseIf slot < PICK_ROWS * 2 Then
-                rowIdx = PICK_R0 + (slot - PICK_ROWS)
-                wsD.Range("F" & rowIdx).Value = _
-                    IIf(prevSel.Exists(mid), prevSel(mid), "Yes")
-                wsD.Range("G" & rowIdx).Value = mid
-                wsD.Range("H" & rowIdx).Value = nm
-            End If
+        If Len(mid) > 0 And tg = tag And act = "YES" And slot < PICK_ROWS Then
+            Dim rowIdx As Long: rowIdx = PICK_R0 + slot
+            wsD.Range("B" & rowIdx).Value = IIf(prevSel.Exists(mid), prevSel(mid), "Yes")
+            wsD.Range("C" & rowIdx).Value = mid
+            wsD.Range("D" & rowIdx).Value = nm
             slot = slot + 1
         End If
     Next i
@@ -238,36 +204,24 @@ Finalize:
     wsD.Range("LastTag").Value = tag
 End Sub
 
-Private Sub SnapshotOne(ws As Worksheet, d As Object, midCell As String, showCell As String)
-    Dim mid As String, sh As String
-    mid = Trim$(CStr(ws.Range(midCell).Value))
-    sh  = Trim$(CStr(ws.Range(showCell).Value))
-    If Len(mid) > 0 And Not d.Exists(mid) Then d.Add mid, sh
-End Sub
-
 Private Function CollectSelectedMachines(ws As Worksheet) As Object
-    ' Returns dict of  machine_id -> True  for every ticked slot in the picker.
     Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
     Dim rr As Long, k As Long, mid As String, sh As String
     For rr = 0 To PICK_ROWS - 1
         k = PICK_R0 + rr
         mid = Trim$(CStr(ws.Range("C" & k).Value))
         sh  = UCase$(Trim$(CStr(ws.Range("B" & k).Value)))
-        If Len(mid) > 0 And sh = "YES" Then d(mid) = True
-        mid = Trim$(CStr(ws.Range("G" & k).Value))
-        sh  = UCase$(Trim$(CStr(ws.Range("F" & k).Value)))
-        If Len(mid) > 0 And sh = "YES" Then d(mid) = True
+        If Len(mid) > 0 And sh = "YES" Then d(mid) = k   ' remember row for util fill
     Next rr
     Set CollectSelectedMachines = d
 End Function
 
 '--------------------------------------------------------------------------
-'  IMPORT  CSV
+'  IMPORT  CSV  (8 columns)
 '--------------------------------------------------------------------------
 Public Sub ImportCSV()
-    Dim fd As FileDialog
-    Set fd = Application.FileDialog(msoFileDialogOpen)
-    fd.Title = "Select CSV (machine_id, tag, timestamp, metric1, metric2, metric3)"
+    Dim fd As FileDialog: Set fd = Application.FileDialog(msoFileDialogOpen)
+    fd.Title = "Select CSV (machine_id, tag, timestamp, m1, m2, m3, running_hrs, downtime_hrs)"
     fd.AllowMultiSelect = False
     fd.Filters.Clear
     fd.Filters.Add "CSV files", "*.csv"
@@ -292,7 +246,7 @@ Public Sub ImportCSV()
         Line Input #ff, line
         If Len(Trim$(line)) = 0 Then GoTo Continue
         parts = SplitCSV(line)
-        If UBound(parts) < 5 Then GoTo Continue
+        If UBound(parts) < 7 Then GoTo Continue
 
         If isFirst Then
             isFirst = False
@@ -312,6 +266,8 @@ Public Sub ImportCSV()
             .Cells(1, 4).Value = CDblSafe(parts(3))
             .Cells(1, 5).Value = CDblSafe(parts(4))
             .Cells(1, 6).Value = CDblSafe(parts(5))
+            .Cells(1, 7).Value = CDblSafe(parts(6))   ' running hrs (cum)
+            .Cells(1, 8).Value = CDblSafe(parts(7))   ' downtime hrs (delta)
         End With
         added = added + 1
 Continue:
@@ -329,7 +285,7 @@ End Sub
 
 Private Function SplitCSV(line As String) As String()
     Dim out() As String, buf As String, inQ As Boolean, i As Long, ch As String
-    ReDim out(0 To 5)
+    ReDim out(0 To 7)
     Dim col As Long: col = 0
     For i = 1 To Len(line)
         ch = Mid$(line, i, 1)
@@ -359,42 +315,43 @@ Public Sub RefreshDashboard()
     Dim wsD As Worksheet: Set wsD = ThisWorkbook.Worksheets(SHT_DASH)
     Dim wsX As Worksheet: Set wsX = ThisWorkbook.Worksheets(SHT_DATA)
 
-    ' 1. Populate/refresh the machine picker for the current tag
     RefreshMachinePicker False
 
-    ' 2. Read filters
     Dim dStart As Date, dEnd As Date, tag As String
     dStart = wsD.Range("StartDate").Value
     dEnd   = wsD.Range("EndDate").Value
     tag    = CStr(wsD.Range("TagFilter").Value)
 
-    ' 3. Collect ticked machines
     Dim sel As Object: Set sel = CollectSelectedMachines(wsD)
-    Dim machines() As String, mCount As Long
+    Dim machines() As String, mRow() As Long, mCount As Long
     ReDim machines(0 To 15)
+    ReDim mRow(0 To 15)
     mCount = 0
 
-    Dim keys As Variant
-    keys = sel.keys
+    Dim keys As Variant: keys = sel.keys
     Dim i As Long
     For i = 0 To sel.count - 1
         machines(mCount) = CStr(keys(i))
+        mRow(mCount) = CLng(sel(keys(i)))
         mCount = mCount + 1
     Next i
 
-    ' 4. Clear staging (rows 30..500, cols R:AF)
     Application.ScreenUpdating = False
-    wsD.Range("R30:AF500").ClearContents
 
-    ' 5. Header row on staging (row 30)
-    wsD.Cells(30, 18).Value = "Date"
+    ' Clear staging area for charts + per-machine util rows
+    wsD.Range("R32:AF500").ClearContents
+    Dim rr As Long
+    For rr = PICK_R0 To PICK_R0 + PICK_ROWS - 1
+        wsD.Range("F" & rr & ":P" & rr).ClearContents
+    Next rr
+
+    ' Header row on staging
+    wsD.Cells(32, 18).Value = "Date"
     For i = 0 To mCount - 1
-        wsD.Cells(30, 19 + i).Value = machines(i)
+        wsD.Cells(32, 19 + i).Value = machines(i)
     Next i
 
-    If mCount = 0 Then GoTo Rebind
-
-    ' 6. Metric focus → column offset inside DataBody array
+    ' Metric focus → col in DataBody
     Dim focus As String: focus = CStr(wsD.Range("MetricFocus").Value)
     Dim colOffset As Long
     Select Case focus
@@ -404,68 +361,156 @@ Public Sub RefreshDashboard()
         Case Else:        colOffset = 4
     End Select
 
-    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
     Dim lo As ListObject: Set lo = wsX.ListObjects(TBL_DATA)
-    Dim rng As Range: Set rng = lo.DataBodyRange
-    If rng Is Nothing Then GoTo Rebind
-
-    Dim arr As Variant: arr = rng.Value
-    Dim n As Long: n = UBound(arr, 1)
-
-    Dim sums() As Double, cnts() As Long
-    ReDim sums(1 To 400, 0 To mCount - 1)
-    ReDim cnts(1 To 400, 0 To mCount - 1)
-    Dim dateList() As Date
-    ReDim dateList(1 To 400)
     Dim dCount As Long: dCount = 0
 
-    Dim ts As Date, mid As String, tg As String, key As String, mIdx As Long, dIdx As Long
-    Dim v As Double
-    For i = 1 To n
-        mid = CStr(arr(i, 1))
-        tg  = CStr(arr(i, 2))
-        If tg = tag And sel.Exists(mid) Then
-            If IsDate(arr(i, 3)) Then
-                ts = CDate(arr(i, 3))
-                If ts >= dStart And ts < dEnd + 1 Then
-                    mIdx = MachineIndex(machines, mCount, mid)
-                    If mIdx >= 0 Then
-                        key = Format$(ts, "yyyy-mm-dd")
-                        If dict.Exists(key) Then
-                            dIdx = dict(key)
-                        Else
-                            dCount = dCount + 1
-                            dict.Add key, dCount
-                            dateList(dCount) = DateSerial(Year(ts), Month(ts), Day(ts))
-                            dIdx = dCount
+    ' Per-machine aggregates for utilization
+    Dim runFirst() As Double, runLast() As Double
+    Dim downSum()  As Double, seen() As Boolean, firstTs() As Date, lastTs() As Date
+    ReDim runFirst(0 To 15)
+    ReDim runLast(0 To 15)
+    ReDim downSum(0 To 15)
+    ReDim seen(0 To 15)
+    ReDim firstTs(0 To 15)
+    ReDim lastTs(0 To 15)
+
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    Dim sums() As Double, cnts() As Long
+    ReDim sums(1 To 500, 0 To 15)
+    ReDim cnts(1 To 500, 0 To 15)
+    Dim dateList() As Date: ReDim dateList(1 To 500)
+
+    If Not lo.DataBodyRange Is Nothing And mCount > 0 Then
+        Dim arr As Variant: arr = lo.DataBodyRange.Value
+        Dim n As Long: n = UBound(arr, 1)
+
+        Dim ts As Date, mid As String, tg As String, key As String
+        Dim mIdx As Long, dIdx As Long, v As Double
+        For i = 1 To n
+            mid = CStr(arr(i, 1))
+            tg  = CStr(arr(i, 2))
+            If tg = tag And sel.Exists(mid) Then
+                If IsDate(arr(i, 3)) Then
+                    ts = CDate(arr(i, 3))
+                    If ts >= dStart And ts < dEnd + 1 Then
+                        mIdx = MachineIndex(machines, mCount, mid)
+                        If mIdx >= 0 Then
+                            ' --- metric aggregation for chart ---
+                            key = Format$(ts, "yyyy-mm-dd")
+                            If dict.Exists(key) Then
+                                dIdx = dict(key)
+                            Else
+                                dCount = dCount + 1
+                                dict.Add key, dCount
+                                dateList(dCount) = DateSerial(Year(ts), Month(ts), Day(ts))
+                                dIdx = dCount
+                            End If
+                            v = CDblSafe(CStr(arr(i, colOffset)))
+                            sums(dIdx, mIdx) = sums(dIdx, mIdx) + v
+                            cnts(dIdx, mIdx) = cnts(dIdx, mIdx) + 1
+
+                            ' --- utilization aggregation ---
+                            Dim runVal As Double, downVal As Double
+                            runVal  = CDblSafe(CStr(arr(i, 7)))
+                            downVal = CDblSafe(CStr(arr(i, 8)))
+                            downSum(mIdx) = downSum(mIdx) + downVal
+                            If Not seen(mIdx) Then
+                                seen(mIdx) = True
+                                runFirst(mIdx) = runVal
+                                runLast(mIdx) = runVal
+                                firstTs(mIdx) = ts
+                                lastTs(mIdx) = ts
+                            Else
+                                If ts < firstTs(mIdx) Then
+                                    firstTs(mIdx) = ts
+                                    runFirst(mIdx) = runVal
+                                End If
+                                If ts > lastTs(mIdx) Then
+                                    lastTs(mIdx) = ts
+                                    runLast(mIdx) = runVal
+                                End If
+                            End If
                         End If
-                        v = CDblSafe(CStr(arr(i, colOffset)))
-                        sums(dIdx, mIdx) = sums(dIdx, mIdx) + v
-                        cnts(dIdx, mIdx) = cnts(dIdx, mIdx) + 1
                     End If
                 End If
             End If
-        End If
-    Next i
+        Next i
 
-    If dCount > 0 Then
-        QuickSortDates dateList, 1, dCount
-        Dim rowOut As Long
-        For rowOut = 1 To dCount
-            wsD.Cells(30 + rowOut, 18).Value = dateList(rowOut)
-            wsD.Cells(30 + rowOut, 18).NumberFormat = "yyyy-mm-dd"
-            key = Format$(dateList(rowOut), "yyyy-mm-dd")
-            dIdx = dict(key)
-            For mIdx = 0 To mCount - 1
-                If cnts(dIdx, mIdx) > 0 Then
-                    wsD.Cells(30 + rowOut, 19 + mIdx).Value = sums(dIdx, mIdx) / cnts(dIdx, mIdx)
-                End If
-            Next mIdx
-        Next rowOut
+        ' Write chart staging
+        If dCount > 0 Then
+            QuickSortDates dateList, 1, dCount
+            Dim rowOut As Long
+            For rowOut = 1 To dCount
+                wsD.Cells(32 + rowOut, 18).Value = dateList(rowOut)
+                wsD.Cells(32 + rowOut, 18).NumberFormat = "yyyy-mm-dd"
+                key = Format$(dateList(rowOut), "yyyy-mm-dd")
+                dIdx = dict(key)
+                For mIdx = 0 To mCount - 1
+                    If cnts(dIdx, mIdx) > 0 Then
+                        wsD.Cells(32 + rowOut, 19 + mIdx).Value = sums(dIdx, mIdx) / cnts(dIdx, mIdx)
+                    End If
+                Next mIdx
+            Next rowOut
+        End If
     End If
 
-Rebind:
-    RebindCharts wsD, mCount, IIf(dCount > 0, dCount, 0)
+    ' --- Fill per-machine utilization table + aggregate KPIs ---
+    Dim calHrs As Double: calHrs = (CDbl(dEnd) - CDbl(dStart) + 1) * 24#
+    If calHrs <= 0 Then calHrs = 24#
+
+    Dim totalRun As Double, totalDown As Double
+    Dim sumUtilAvail As Double, sumUtilCal As Double, kMach As Long
+    totalRun = 0: totalDown = 0
+    sumUtilAvail = 0: sumUtilCal = 0: kMach = 0
+
+    For i = 0 To mCount - 1
+        Dim runHrs As Double, downHrs As Double, uAvail As Double, uCal As Double
+        If seen(i) Then
+            runHrs = runLast(i) - runFirst(i)
+            If runHrs < 0 Then runHrs = 0    ' safety: meter reset or wrap
+        Else
+            runHrs = 0
+        End If
+        downHrs = downSum(i)
+
+        If (runHrs + downHrs) > 0 Then
+            uAvail = runHrs / (runHrs + downHrs) * 100#
+        Else
+            uAvail = 0
+        End If
+        uCal = runHrs / calHrs * 100#
+
+        ' write row
+        Dim r As Long: r = mRow(i)
+        wsD.Range("F" & r).Value = runHrs
+        wsD.Range("H" & r).Value = downHrs
+        wsD.Range("J" & r).Value = uAvail
+        wsD.Range("M" & r).Value = uCal
+        wsD.Range("F" & r).NumberFormat = "0.00"
+        wsD.Range("H" & r).NumberFormat = "0.00"
+        wsD.Range("J" & r).NumberFormat = "0.0"
+        wsD.Range("M" & r).NumberFormat = "0.0"
+
+        totalRun = totalRun + runHrs
+        totalDown = totalDown + downHrs
+        sumUtilAvail = sumUtilAvail + uAvail
+        sumUtilCal = sumUtilCal + uCal
+        kMach = kMach + 1
+    Next i
+
+    ' Aggregate KPI tiles
+    wsD.Range("KpiRunHrs").Value  = totalRun
+    wsD.Range("KpiDownHrs").Value = totalDown
+    If kMach > 0 Then
+        wsD.Range("KpiUtilAvail").Value = sumUtilAvail / kMach
+        wsD.Range("KpiUtilCal").Value   = sumUtilCal / kMach
+    Else
+        wsD.Range("KpiUtilAvail").Value = 0
+        wsD.Range("KpiUtilCal").Value   = 0
+    End If
+
+    RebindCharts wsD, mCount, dCount
+
     Application.ScreenUpdating = True
 End Sub
 
@@ -495,7 +540,7 @@ End Sub
 
 Private Sub RebindCharts(ws As Worksheet, mCount As Long, dCount As Long)
     Dim co As ChartObject, ch As Chart
-    Dim lastRow As Long: lastRow = 30 + dCount
+    Dim lastRow As Long: lastRow = 32 + dCount
 
     For Each co In ws.ChartObjects
         Set ch = co.Chart
@@ -507,9 +552,9 @@ Private Sub RebindCharts(ws As Worksheet, mCount As Long, dCount As Long)
         Dim m As Long
         For m = 1 To mCount
             With ch.SeriesCollection.NewSeries
-                .Name = "='" & ws.Name & "'!" & ws.Cells(30, 18 + m).Address
-                .XValues = ws.Range(ws.Cells(31, 18), ws.Cells(lastRow, 18))
-                .Values  = ws.Range(ws.Cells(31, 18 + m), ws.Cells(lastRow, 18 + m))
+                .Name = "='" & ws.Name & "'!" & ws.Cells(32, 18 + m).Address
+                .XValues = ws.Range(ws.Cells(33, 18), ws.Cells(lastRow, 18))
+                .Values  = ws.Range(ws.Cells(33, 18 + m), ws.Cells(lastRow, 18 + m))
                 .Format.Line.Weight = 1.75
                 .Smooth = True
                 Select Case (m - 1) Mod 8
@@ -552,7 +597,7 @@ Public Sub GenerateReport()
     snap.Tab.Color = RGB(155, 197, 61)
     snap.UsedRange.Value = snap.UsedRange.Value
 
-    snap.Range("B63").Value = "  Report generated " & Format$(Now, "yyyy-mm-dd hh:mm") & _
+    snap.Range("B65").Value = "  Report generated " & Format$(Now, "yyyy-mm-dd hh:mm") & _
                               "  |  Tag: " & tag & _
                               "  |  Range: " & Format$(dStart, "yyyy-mm-dd") & _
                               " → " & Format$(dEnd, "yyyy-mm-dd")
@@ -612,7 +657,6 @@ End Function
 Public Sub ClearData()
     If MsgBox("Delete every row in the Data table? This cannot be undone.", _
               vbYesNo + vbExclamation, "Clear data") <> vbYes Then Exit Sub
-
     Dim lo As ListObject
     Set lo = ThisWorkbook.Worksheets(SHT_DATA).ListObjects(TBL_DATA)
     If Not lo.DataBodyRange Is Nothing Then lo.DataBodyRange.Delete
@@ -620,7 +664,7 @@ Public Sub ClearData()
 End Sub
 
 '--------------------------------------------------------------------------
-'  LIVE  UPDATES
+'  LIVE UPDATES
 '--------------------------------------------------------------------------
 Public Sub ToggleLive()
     gLiveOn = Not gLiveOn
